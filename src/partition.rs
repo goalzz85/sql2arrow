@@ -1,20 +1,31 @@
-use std::{borrow::BorrowMut, collections::HashMap, hash::Hash};
+use std::{collections::HashMap, hash::Hash};
 use arrow_array::ArrayRef;
 use arrow_schema::{DataType, TimeUnit};
-use iceberg::{spec::Transform, transform::{self, create_transform_function, BoxedTransformFunction}};
-use pyo3::{prelude::*};
-use crate::{partition, types::ColumnArrStrDef};
-use anyhow::{anyhow};
+use iceberg::{spec::Transform, transform::create_transform_function};
+use pyo3::prelude::*;
+use crate::types::ColumnArrStrDef;
+use anyhow::anyhow;
 use std::sync::Arc;
 
 
 
 #[derive(Debug, PartialEq, Eq, Clone, Hash)]
 pub(crate) enum PartitionType {
+    Default,
     Iceberg,
 }
 
+impl std::fmt::Display for PartitionType {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            PartitionType::Default => write!(f, "Default"),
+            PartitionType::Iceberg => write!(f, "Iceberg"),
+        }
+    }
+}
+
 pub trait PartitionFunc: Send + Sync {
+    fn partition_type(&self) -> PartitionType;
     fn transform(&self, arr_refs : &Vec<ArrayRef>) -> anyhow::Result<Vec<ArrayRef>>;
 }
 
@@ -44,7 +55,12 @@ pub struct DefaultPartition {
 
 }
 impl PartitionFunc for DefaultPartition {
+    fn partition_type(&self) -> PartitionType {
+        PartitionType::Default
+    }
+
     fn transform(&self, arr_refs : &Vec<ArrayRef>) -> anyhow::Result<Vec<ArrayRef>> {
+        let _ = arr_refs;
         Err(anyhow!("not implement the PartitionFunc"))
     }
 }
@@ -83,7 +99,7 @@ impl IceBergPartition {
 
         for (col_name, transform_str) in col_partition_defs {
             let mut is_have_col = false;
-            for (idx, (col_name_def, col_data_type_def)) in columns_def.iter().enumerate() {
+            for (idx, (col_name_def, _col_data_type_def)) in columns_def.iter().enumerate() {
                 if col_name.eq(col_name_def) {
                     is_have_col = true;
                     col_idxs.push(idx);
@@ -107,6 +123,10 @@ impl IceBergPartition {
 
 
 impl PartitionFunc for IceBergPartition {
+    fn partition_type(&self) -> PartitionType {
+        PartitionType::Iceberg
+    }
+
     fn transform(&self, arr_refs : &Vec<ArrayRef>) -> anyhow::Result<Vec<ArrayRef>> {
         let mut res_arr_refs = Vec::<ArrayRef>::with_capacity(arr_refs.len());
 

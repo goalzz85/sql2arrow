@@ -1,27 +1,30 @@
 mod types;
 mod arraybuilder;
 mod partition;
+mod pylog;
 
 
 use std::collections::HashMap;
 use std::io::Read;
+use std::os::unix::fs::MetadataExt;
 use std::sync::Arc;
-use std::thread;
+use std::{thread, time};
 use std::time::Instant;
 
-use anyhow::{anyhow};
+use anyhow::anyhow;
 use arrow::array::{Array, ArrayRef as ArrowArrayRef};
 use arrow::compute::{SortColumn, TakeOptions};
 use arrow_array::UInt32Array;
 use flate2::read::GzDecoder;
 use mimalloc::MiMalloc;
 use partition::{get_parition_key_from_first_val, py_partition_func_spec_obj_to_rust, DefaultPartition, PartitionFunc, PartitionKey};
-use pyo3::{iter, prelude::*};
+use pyo3::prelude::*;
 use pyo3_arrow::error::PyArrowResult;
-use pyo3_arrow::{PyArray, PyChunkedArray};
+use pyo3_arrow::PyArray;
 use sqlparser::dialect::{self, Dialect};
 use sqlparser::ast::{Insert, SetExpr, Statement, Values};
 use types::ColumnArrStrDef;
+
 
 #[global_allocator]
 static GLOBAL: MiMalloc = MiMalloc;
@@ -29,34 +32,64 @@ static GLOBAL: MiMalloc = MiMalloc;
 /// A Python module implemented in Rust.
 #[pymodule]
 fn sql2arrow(m: &Bound<'_, PyModule>) -> PyResult<()> {
+
     m.add_function(wrap_pyfunction!(load_sqls, m)?)?;
     m.add_function(wrap_pyfunction!(load_sqls_with_dataset, m)?)?;
+    m.add_function(wrap_pyfunction!(enable_log, m)?)?;
     Ok(())
 }
 
 #[pyfunction]
+fn enable_log(level:i32) -> anyhow::Result<()> {
+    let filter = match level {
+        //logging.CRITICAL and logging.ERROR
+        50 | 40 => log::LevelFilter::Error,
+        //logging.WARNING
+        30 => log::LevelFilter::Warn,
+        //logging.INFO
+        20 => log::LevelFilter::Info,
+        //logging.DEBUG
+        10 => log::LevelFilter::Debug,
+        //logging.NOTSET
+        0 => log::LevelFilter::Off,
+        _ => {
+            return Err(anyhow!("not support log level code: {}", level));
+        }
+    };
+    pylog::enable_log(filter)
+}
+
+#[pyfunction]
 #[pyo3(signature = (sql_paths, columns, partition_func_spec_obj=None, compression_type=None, dialect=None))]
-fn load_sqls(sql_paths : Vec<String>, columns: ColumnArrStrDef, partition_func_spec_obj : Option<PyObject>, compression_type : Option<String>, dialect : Option<String>) -> anyhow::Result<Vec<Vec<PyArray>>> {
+fn load_sqls(py : Python<'_>, sql_paths : Vec<String>, columns: ColumnArrStrDef, partition_func_spec_obj : Option<PyObject>, compression_type : Option<String>, dialect : Option<String>) -> anyhow::Result<Vec<Vec<PyArray>>> {
     if sql_paths.is_empty() {
         return Err(anyhow!("sql_paths is empty"));
     }
 
-    let mut sql_dataset = Vec::with_capacity(sql_paths.len());
-    for sql_path in sql_paths {
-        let buffer = std::fs::read(sql_path)?;
-        sql_dataset.push(buffer);
-    }
+    let mut sql_files = Vec::<SqlFileWrapper>::with_capacity(sql_paths.len());
 
-    load_sqls_with_dataset(sql_dataset, columns, partition_func_spec_obj, compression_type, dialect)
+    for sql_path in &sql_paths {
+        let sql_file = std::fs::File::open(sql_path)?;
+        sql_files.push(SqlFileWrapper(sql_file));
+    }
+    
+    inner_load_sqls_with_dataset(py, sql_files, columns, partition_func_spec_obj, compression_type, dialect)
 }
 
 #[pyfunction]
 #[pyo3(signature = (sql_dataset, columns, partition_func_spec_obj=None, compression_type=None, dialect=None))]
-fn load_sqls_with_dataset(sql_dataset : Vec<Vec<u8>>, columns: ColumnArrStrDef, partition_func_spec_obj : Option<PyObject>, compression_type : Option<String>, dialect : Option<String>) -> anyhow::Result<Vec<Vec<PyArray>>> {
+fn load_sqls_with_dataset(py : Python<'_>, sql_dataset : Vec<Vec<u8>>, columns: ColumnArrStrDef, partition_func_spec_obj : Option<PyObject>, compression_type : Option<String>, dialect : Option<String>) -> anyhow::Result<Vec<Vec<PyArray>>> {
+    inner_load_sqls_with_dataset(py, sql_dataset, columns, partition_func_spec_obj, compression_type, dialect)
+}
+
+fn inner_load_sqls_with_dataset<T>(py : Python<'_>, sql_dataset : Vec<T>, columns: ColumnArrStrDef, partition_func_spec_obj : Option<PyObject>, compression_type : Option<String>, dialect : Option<String>) -> anyhow::Result<Vec<Vec<PyArray>>>
+where T : Into<Vec<u8>> + Send + 'static
+{
     if sql_dataset.is_empty() {
         return Err(anyhow!("sql_dataset is empty"));
     }
 
+    let sql_dataset_len = sql_dataset.len();
     let mut partition_func : Arc<dyn PartitionFunc> = Arc::new(DefaultPartition{});
     let mut is_have_partition_func = false;
 
@@ -65,36 +98,66 @@ fn load_sqls_with_dataset(sql_dataset : Vec<Vec<u8>>, columns: ColumnArrStrDef, 
         is_have_partition_func = true;
     }
 
-    let data = if !is_have_partition_func {
-        match load_without_partition(sql_dataset, columns, compression_type, dialect) {
-            Ok(pyarrs) => PyArrowResult::Ok(pyarrs),
-            Err(e) => Err(pyo3_arrow::error::PyArrowError::PyErr(
+    py.allow_threads(|| -> anyhow::Result<Vec<Vec<PyArray>>> {
+        let load_start_time = Instant::now();
+        let data = if !is_have_partition_func {
+            pyinfo!("Starting to load {} sql datasets to Arrow without partition func.", sql_dataset_len);
+            match load_without_partition_func(sql_dataset, columns, compression_type, dialect) {
+                Ok(pyarrs) => PyArrowResult::Ok(pyarrs),
+                Err(e) => Err(pyo3_arrow::error::PyArrowError::PyErr(
+                        pyo3::exceptions::PyRuntimeError::new_err(e.to_string())
+                    )),
+            }
+        } else {
+            pyinfo!("Starting to load {} sql datasets to Arrow with partition func {}.", sql_dataset_len, partition_func.partition_type());
+            match load_with_partition_func(sql_dataset, columns, partition_func, compression_type, dialect) {
+                Ok(pyarrs) => PyArrowResult::Ok(pyarrs),
+                Err(e) => Err(pyo3_arrow::error::PyArrowError::PyErr(
                     pyo3::exceptions::PyRuntimeError::new_err(e.to_string())
                 )),
-        }
-    } else {
-        match load_with_partition(sql_dataset, columns, partition_func, compression_type, dialect) {
-            Ok(pyarrs) => PyArrowResult::Ok(pyarrs),
-            Err(e) => Err(pyo3_arrow::error::PyArrowError::PyErr(
-                pyo3::exceptions::PyRuntimeError::new_err(e.to_string())
-            )),
-        }
-    }?;
+            }
+        }?;
 
-    Ok(data)
+        pyinfo!("load {} sql datasets to Arrow has finished in {} seconds.", sql_dataset_len, load_start_time.elapsed().as_secs_f32());
+        Ok(data)
+    })
+
 }
 
-fn decompress_by_type(sql_data : Vec<u8>, compression_type_op : Option<String>) -> anyhow::Result<Vec<u8>> {
+struct SqlFileWrapper(std::fs::File);
+
+impl Into<Vec<u8>> for SqlFileWrapper {
+    
+    fn into(mut self) -> Vec<u8> {
+        let file_size : usize = self.0.metadata().unwrap().size().try_into().unwrap();
+        let mut buf = Vec::<u8>::with_capacity(file_size);
+        let read_size = self.0.read_to_end(&mut buf).unwrap();
+        if read_size != file_size {
+            assert_eq!(file_size, read_size);
+        }
+
+        buf
+    }
+}
+
+fn decompress_by_type(sql_data : Vec<u8>, compression_type_op : Option<String>, i_thread : usize) -> anyhow::Result<Vec<u8>> {
     if let Some(compression_type) = compression_type_op {
-        match compression_type.as_str() {
+        let decompress_start_time = time::Instant::now();
+        let data_res = match compression_type.as_str() {
             "gzip" => {
-                    let mut decoder = GzDecoder::new(sql_data.as_slice());
-                    let mut buf = Vec::new();
-                    let _ = decoder.read_to_end(&mut buf);
-                    Ok(buf)
+                let mut decoder = GzDecoder::new(sql_data.as_slice());
+                let mut buf = Vec::new();
+                let _ = decoder.read_to_end(&mut buf);
+                Ok(buf)
             },
             _ => Err(anyhow!("not supported compression type"))
+        };
+
+        if data_res.is_ok() {
+            pydebug!("thread(idx:{}) took {} seconds to decompress {} bytes size of {}-compressed data.", i_thread, decompress_start_time.elapsed().as_secs_f32(), sql_data.len(), compression_type.as_str());
         }
+
+        data_res
     } else {
         Ok(sql_data)
     }
@@ -111,7 +174,7 @@ fn parse_dialect(dialect_op : &Option<String>) -> anyhow::Result<Box<dyn Dialect
     }
 }
 
-fn load_without_partition(sql_dataset : Vec<Vec<u8>>, columns : ColumnArrStrDef, compression_type_op : Option<String>, dialect_op : Option<String>) -> anyhow::Result<Vec<Vec<PyArray>>> {
+fn load_without_partition_func<T: Into<Vec<u8>> + Send + 'static> (sql_dataset : Vec<T>, columns : ColumnArrStrDef, compression_type_op : Option<String>, dialect_op : Option<String>) -> anyhow::Result<Vec<Vec<PyArray>>> {
     let sql_dataset_len = sql_dataset.len();
     let _dia = parse_dialect(&dialect_op)?;
 
@@ -128,7 +191,8 @@ fn load_without_partition(sql_dataset : Vec<Vec<u8>>, columns : ColumnArrStrDef,
         i += 1;
 
         let handler = thread::spawn(move || {
-            let sql_data_res = decompress_by_type(sql_data, compression_type_op_thread);
+            let thread_start_time = time::Instant::now();
+            let sql_data_res = decompress_by_type(sql_data.into(), compression_type_op_thread, i_thread);
             if sql_data_res.is_err() {
                 let _ = tx_thread.send(Err(sql_data_res.err().unwrap()));
             } else {
@@ -136,6 +200,7 @@ fn load_without_partition(sql_dataset : Vec<Vec<u8>>, columns : ColumnArrStrDef,
                 match load_sql_data_to_arrref(&sql_data, columns_thread, dialect_op_thread,i_thread) {
                     Ok(arr_refs) => {
                         let _ = tx_thread.send(Ok((i_thread, arr_refs)));
+                        pydebug!("thread(idx:{}) took {} seconds to load {} bytes of decompressed data into arrow", i_thread, thread_start_time.elapsed().as_secs_f32(), sql_data.len());
                     },
                     Err(e) => {
                         let _ = tx_thread.send(Err(e));
@@ -143,9 +208,8 @@ fn load_without_partition(sql_dataset : Vec<Vec<u8>>, columns : ColumnArrStrDef,
                 }
             }
             drop(tx_thread)
+            
         });
-
-
 
         handlers.push(handler);
     }
@@ -185,7 +249,8 @@ fn load_without_partition(sql_dataset : Vec<Vec<u8>>, columns : ColumnArrStrDef,
 }
 
 
-fn load_with_partition(sql_dataset : Vec<Vec<u8>>, columns : ColumnArrStrDef, partition_func : Arc<dyn PartitionFunc>, compression_type_op : Option<String>, dialect_op : Option<String>) -> anyhow::Result<Vec<Vec<PyArray>>> {
+fn load_with_partition_func<T: Into<Vec<u8>> + Send + 'static>(sql_dataset : Vec<T>, columns : ColumnArrStrDef, partition_func : Arc<dyn PartitionFunc>, compression_type_op : Option<String>, dialect_op : Option<String>) -> anyhow::Result<Vec<Vec<PyArray>>> {
+
     fn get_sorted_indices_from_multi_cols(arr_refs : &Vec<ArrowArrayRef>) -> anyhow::Result<UInt32Array> {
         let mut sort_cols = Vec::<SortColumn>::with_capacity(arr_refs.len());
         for arr_ref in arr_refs {
@@ -249,23 +314,16 @@ fn load_with_partition(sql_dataset : Vec<Vec<u8>>, columns : ColumnArrStrDef, pa
         i += 1;
 
         let handler = thread::spawn(move || {
+            let thread_start_time = time::Instant::now();
 
             let res_for_send : anyhow::Result<HashMap<PartitionKey, Vec<ArrowArrayRef>>> = (move || {
-                let sql_data = decompress_by_type(sql_data, compression_type_op_thread)?;
+                let sql_data = decompress_by_type(sql_data.into(), compression_type_op_thread, i_thread)?;
                 let arr_refs = load_sql_data_to_arrref(&sql_data, columns_thread, dialect_op_thread, i_thread)?;
 
-                let mut is_debug = false;
-                match std::env::var("SQL2ARROW_DEBUG") {
-                    Ok(value) => is_debug = true,
-                    _ => {}
-                }
-                let partition_start_time = Instant::now();
                 let partition_val_arr_refs = partition_func_thread.transform(&arr_refs)?;
                 let indices = get_sorted_indices_from_multi_cols(&partition_val_arr_refs)?;
                 let ret = data_to_partitioned_arr_refs(&arr_refs, &partition_val_arr_refs, &indices);
-                if is_debug {
-                    print!("thread idx: {} partition. {:?}\n", i_thread, partition_start_time.elapsed());
-                }
+                pydebug!("thread(idx:{}) took {} seconds to load {} bytes of decompressed data into arrow", i_thread, thread_start_time.elapsed().as_secs_f32(), sql_data.len());
                 ret
             })();
 
@@ -315,14 +373,7 @@ fn load_with_partition(sql_dataset : Vec<Vec<u8>>, columns : ColumnArrStrDef, pa
         return Err(res.err().unwrap());
     }
 
-    let mut is_debug = false;
-    match std::env::var("SQL2ARROW_DEBUG") {
-        Ok(value) => is_debug = true,
-        _ => {}
-    }
-
-    let combine_partition_start_time = Instant::now();
-
+    let rebuild_arr_start_time = time::Instant::now();
     let mut ret_pyarrs = Vec::<Vec<PyArray>>::with_capacity(hash_arr_refs_batch.len());
     for (_, arr_refs_batch) in &hash_arr_refs_batch {
         let mut vertical_arr_refs = vec![Vec::<ArrowArrayRef>::with_capacity(hash_arr_refs_batch.len()); columns.len()];
@@ -341,11 +392,8 @@ fn load_with_partition(sql_dataset : Vec<Vec<u8>>, columns : ColumnArrStrDef, pa
 
         ret_pyarrs.push(new_arr_refs);
     }
-    
-    if is_debug {
-        print!("combine partition. {:?}\n", combine_partition_start_time.elapsed());
-    }
 
+    pydebug!("it took {} seconds to combine the data by partition values.", rebuild_arr_start_time.elapsed().as_secs_f32());
     return Ok(ret_pyarrs);
 }
 /**
@@ -355,16 +403,11 @@ fn load_with_partition(sql_dataset : Vec<Vec<u8>>, columns : ColumnArrStrDef, pa
  * ]
  */
 fn load_sql_data_to_arrref(sql_data : &Vec<u8>, columns : ColumnArrStrDef, dialect_op : Option<String>, idx_thread : usize) -> anyhow::Result<Vec<ArrowArrayRef>> {
-    use std::env;
-    let mut is_debug = false;
-    match env::var("SQL2ARROW_DEBUG") {
-        Ok(value) => is_debug = true,
-        _ => {}
-    }
-
     if sql_data.is_empty() || columns.is_empty() {
         return Err(anyhow!("sql_data is empty or columns is empty"));
     }
+
+    let inner_parsing_building_start_time = time::Instant::now();
 
     let mut dt_vec = Vec::<&str>::with_capacity(columns.len());
     let mut column_name_to_outidx = HashMap::<String, usize>::with_capacity(columns.len());
@@ -378,7 +421,6 @@ fn load_sql_data_to_arrref(sql_data : &Vec<u8>, columns : ColumnArrStrDef, diale
 
     let row_schema : types::RowSchema = dt_vec.try_into()?;
 
-    let parse_sql_start_time = Instant::now();
     let buffer = unsafe {
         std::str::from_utf8_unchecked(&sql_data)
     };
@@ -386,15 +428,15 @@ fn load_sql_data_to_arrref(sql_data : &Vec<u8>, columns : ColumnArrStrDef, diale
     let mut sql_parser = sqlparser::parser::Parser::new(dia.as_ref());
     sql_parser = sql_parser.try_with_sql(&buffer)?;
   
-    if is_debug {
-        print!("thread idx: {} parse sql. {:?}\n", idx_thread, parse_sql_start_time.elapsed());
-    }
     
     let mut val_idx_to_outidx = HashMap::<usize, usize>::with_capacity(columns.len());
 
     let mut expecting_statement_delimiter = false;
 
     let mut builders = row_schema.create_row_array_builders(10000);
+
+
+    let mut total_seconds_for_parsing : f32 = 0.0;
     //loop statement
     loop {
         while sql_parser.consume_token(&sqlparser::tokenizer::Token::SemiColon) {
@@ -416,8 +458,10 @@ fn load_sql_data_to_arrref(sql_data : &Vec<u8>, columns : ColumnArrStrDef, diale
         if expecting_statement_delimiter {
             return sql_parser.expected("end of statement", sql_parser.peek_token())?;
         }
-
+        let parsing_start_time = time::Instant::now();
         let statement = sql_parser.parse_statement()?;
+        total_seconds_for_parsing += parsing_start_time.elapsed().as_secs_f32();
+
         if val_idx_to_outidx.is_empty() {
             match &statement {
                 Statement::Insert(Insert{columns, ..}) => {
@@ -476,5 +520,7 @@ fn load_sql_data_to_arrref(sql_data : &Vec<u8>, columns : ColumnArrStrDef, diale
         arrays.push(arr_ref);
     }
 
+    pydebug!("thread(idx:{}) took {} seconds to parsing data into insert statments.", idx_thread, total_seconds_for_parsing);
+    pydebug!("thread(idx:{}) took {} seconds to parsing and building arrows.", idx_thread, inner_parsing_building_start_time.elapsed().as_secs_f32());
     Ok(arrays)
 }

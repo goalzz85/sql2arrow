@@ -3,6 +3,7 @@ from typing import List
 from enum import Enum
 from . import sql2arrow as s2a
 from . import partition
+from .sql2arrow import enable_log
 
 class Dialect(Enum):
     DEFAULT = None

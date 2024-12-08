@@ -124,6 +124,12 @@ dependencies = [
 ]
 
 [[package]]
+name = "arc-swap"
+version = "1.7.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "69f7f8c3906b62b754cd5326047894316021dcfe5a194c8ea52bdd94934a3457"
+
+[[package]]
 name = "array-init"
 version = "2.1.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -2262,6 +2268,17 @@ dependencies = [
 ]
 
 [[package]]
+name = "pyo3-log"
+version = "0.11.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "3ac84e6eec1159bc2a575c9ae6723baa6ee9d45873e9bebad1e3ad7e8d28a443"
+dependencies = [
+ "arc-swap",
+ "log",
+ "pyo3",
+]
+
+[[package]]
 name = "pyo3-macros"
 version = "0.22.6"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -2930,9 +2947,11 @@ dependencies = [
  "flate2",
  "iceberg",
  "jemallocator",
+ "log",
  "mimalloc",
  "pyo3",
  "pyo3-arrow",
+ "pyo3-log",
  "sqlparser",
  "thiserror 1.0.69",
 ]
