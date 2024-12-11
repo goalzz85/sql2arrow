@@ -6,7 +6,6 @@ mod pylog;
 
 use std::collections::HashMap;
 use std::io::Read;
-use std::os::unix::fs::MetadataExt;
 use std::sync::Arc;
 use std::{thread, time};
 use std::time::Instant;
@@ -129,7 +128,7 @@ struct SqlFileWrapper(std::fs::File);
 impl Into<Vec<u8>> for SqlFileWrapper {
     
     fn into(mut self) -> Vec<u8> {
-        let file_size : usize = self.0.metadata().unwrap().size().try_into().unwrap();
+        let file_size : usize = self.0.metadata().unwrap().len().try_into().unwrap();
         let mut buf = Vec::<u8>::with_capacity(file_size);
         let read_size = self.0.read_to_end(&mut buf).unwrap();
         if read_size != file_size {

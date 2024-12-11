@@ -46,6 +46,7 @@ jobs:
         with:
           target: ${{ matrix.platform.target }}
           args: --release --out dist
+          before-script-linux: 'python3 -m pip --version || python3 -m ensurepip'
           sccache: 'true'
           manylinux: manylinux_2_28
       - name: Upload wheels
