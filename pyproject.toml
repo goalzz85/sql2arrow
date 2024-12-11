@@ -5,12 +5,26 @@ build-backend = "maturin"
 [project]
 name = "sql2arrow"
 requires-python = ">=3.8"
+description = "This is a Python library that provides convenient and high-performance methods to parse INSERT SQL statements into Arrow arrays."
+keywords = ["arrow", "sql", "mysql", "rust"]
+authors = [
+  {email = "goalzz85@gmail.com"},
+  {name = "zhan zhang"}
+]
+maintainers = [
+  {name = "zhan zhang", email = "goalzz85@gmail.com"}
+]
 classifiers = [
+    "Development Status :: 4 - Beta",
     "Programming Language :: Rust",
-    "Programming Language :: Python :: Implementation :: CPython",
-    "Programming Language :: Python :: Implementation :: PyPy",
+    "Programming Language :: Python",
+    "Environment :: Console",
 ]
 dynamic = ["version"]
+
+[project.urls]
+homepage = "https://github.com/goalzz85/sql2arrow"
+
 [tool.maturin]
 features = ["pyo3/extension-module"]
 python-source = "python"

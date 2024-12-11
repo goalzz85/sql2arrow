@@ -2,7 +2,6 @@
 from typing import List
 from enum import Enum
 from . import sql2arrow as s2a
-from . import partition
 from .sql2arrow import enable_log
 
 class Dialect(Enum):
@@ -53,6 +52,10 @@ class Column:
         self.name = name
         self.type = column_arrow_type
 
+def parse_sql(sql : str, columns : List[Column], dialect : Dialect = Dialect.MYSQL):
+    sql_data = sql.encode()
+    datas = _load_sqls_with_sql_datas([sql_data], columns, None, None, dialect.value)
+    return datas[0]
 
 def load_sqls(sql_paths : List[str], columns : List[Column], compression : CompressionType = CompressionType.NONE, dialect : Dialect = Dialect.MYSQL, max_thread_num = 32, pyarrow_fs = None):
     if len(sql_paths) == 0:
