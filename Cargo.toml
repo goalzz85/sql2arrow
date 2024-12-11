@@ -28,7 +28,6 @@ anyhow = "1.0"
 crossbeam-channel = "0.5"
 flate2 = "1.0"
 
-jemallocator = {version = "0.5", features = ["disable_initial_exec_tls"]}
 mimalloc = "0.1"
 
 
