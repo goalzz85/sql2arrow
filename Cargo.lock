@@ -2931,6 +2931,7 @@ dependencies = [
  "pyo3",
  "pyo3-arrow",
  "pyo3-log",
+ "snap",
  "sqlparser",
  "thiserror 1.0.69",
 ]

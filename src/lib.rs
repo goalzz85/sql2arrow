@@ -146,7 +146,13 @@ fn decompress_by_type(sql_data : Vec<u8>, compression_type_op : Option<String>, 
             "gzip" => {
                 let mut decoder = GzDecoder::new(sql_data.as_slice());
                 let mut buf = Vec::new();
-                let _ = decoder.read_to_end(&mut buf);
+                let _ = decoder.read_to_end(&mut buf)?;
+                Ok(buf)
+            },
+            "snappy" => {
+                let mut decoder = snap::read::FrameDecoder::new(sql_data.as_slice());
+                let mut buf = Vec::new();
+                let _ = decoder.read_to_end(&mut buf)?;
                 Ok(buf)
             },
             _ => Err(anyhow!("not supported compression type"))

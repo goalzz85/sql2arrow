@@ -3,14 +3,16 @@ from typing import List
 from enum import Enum
 from . import sql2arrow as s2a
 from .sql2arrow import enable_log
+from . import partition
 
 class Dialect(Enum):
     DEFAULT = None
     MYSQL = "mysql"
 
 class CompressionType(Enum):
-    NONE = None,
+    NONE = None
     GZIP = "gzip"
+    SNAPPY = "snappy"
 
 class ArrowTypes:
     def int8():
@@ -65,9 +67,9 @@ def load_sqls(sql_paths : List[str], columns : List[Column], compression : Compr
 
     if pyarrow_fs is not None:
         sql_datas = _load_data_file_by_pyarrow_fs(sql_paths, pyarrow_fs)
-        return _load_sqls_with_sql_datas(sql_datas, columns, None, compression.value, dialect.value)
+        return _load_sqls_with_sql_datas(sql_datas, columns, None, compression and compression.value, dialect and dialect.value)
 
-    return _load_sqls(sql_paths, columns, None, compression.value, dialect.value)
+    return _load_sqls(sql_paths, columns, None, compression and compression.value, dialect and dialect.value)
 
 def load_sqls_with_partition_func(sql_paths : List[str], columns : List[Column], partition_func = None, compression : CompressionType = CompressionType.NONE,  dialect : Dialect = Dialect.MYSQL, max_thread_num = 32, pyarrow_fs = None):
     if len(sql_paths) == 0:
@@ -77,9 +79,9 @@ def load_sqls_with_partition_func(sql_paths : List[str], columns : List[Column],
 
     if pyarrow_fs is not None:
         sql_datas = _load_data_file_by_pyarrow_fs(sql_paths, pyarrow_fs)
-        return _load_sqls_with_sql_datas(sql_datas, columns, partition_func, compression.value, dialect.value)
+        return _load_sqls_with_sql_datas(sql_datas, columns, partition_func, compression and compression.value, dialect and dialect.value)
 
-    return _load_sqls(sql_paths, columns, partition_func, compression.value, dialect.value)
+    return _load_sqls(sql_paths, columns, partition_func, compression and compression.value, dialect and dialect.value)
 
 def _load_sqls(sql_paths : List[str], columns : List[Column], partition_func = None, compression = None, dialect = None):
     column_defs = [(c.name, c.type) for c in columns]

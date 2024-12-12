@@ -27,6 +27,7 @@ thiserror = "1.0"
 anyhow = "1.0"
 crossbeam-channel = "0.5"
 flate2 = "1.0"
+snap = "1.1"
 
 mimalloc = "0.1"
 

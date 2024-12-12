@@ -74,3 +74,4 @@ docs/_build/
 mq_log.sql
 region.sql
 region.sql.gz
+region.sql.snappy
