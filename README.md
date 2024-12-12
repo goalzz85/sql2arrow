@@ -4,6 +4,14 @@ This is a Python library that provides convenient and high-performance methods t
 
 ## How to use
 
+### Installation
+
+Install the latest SQL2arrow version with:
+
+```bash
+pip install sql2arrow
+```
+
 ### Parsing SQL str
 ```python
 import sql2arrow
