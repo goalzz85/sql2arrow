@@ -172,6 +172,7 @@ fn parse_dialect(dialect_op : &Option<String>) -> anyhow::Result<Box<dyn Dialect
     if let Some(dialect_str) = dialect_op {
         match dialect_str.as_str() {
             "mysql" => Ok(Box::new(dialect::MySqlDialect{})),
+            "postgresql" => Ok(Box::new(dialect::PostgreSqlDialect{})),
             _ => Err(anyhow!("not supported dialect"))
         }
     } else {

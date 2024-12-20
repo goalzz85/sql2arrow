@@ -8,6 +8,7 @@ from . import partition
 class Dialect(Enum):
     DEFAULT = None
     MYSQL = "mysql"
+    PGSQL = "postgresql"
 
 class CompressionType(Enum):
     NONE = None
@@ -46,6 +47,10 @@ class ArrowTypes:
     
     def decimal128(precision, scale):
         return f"Decimal128({precision},{scale})"
+    
+    def decimal256(precision, scale):
+        return f"Decimal256({precision},{scale})"
+    
     
 
 

@@ -59,7 +59,7 @@ fn is_allowed_datatype(dt : &ArrowDataType) -> bool {
         
         ArrowDataType::Float32 | ArrowDataType::Float64 => true,
 
-        ArrowDataType::Decimal128(_,_) => true,
+        ArrowDataType::Decimal128(_,_) | ArrowDataType::Decimal256(_,_)=> true,
 
         ArrowDataType::Boolean => true,
 
