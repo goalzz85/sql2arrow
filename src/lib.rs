@@ -2,6 +2,7 @@ mod types;
 mod arraybuilder;
 mod partition;
 mod pylog;
+mod loader;
 
 
 use std::collections::HashMap;
