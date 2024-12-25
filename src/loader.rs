@@ -1,4 +1,4 @@
-use std::{collections::HashMap, io::Read, sync::{atomic::{AtomicBool, AtomicUsize}, Arc}, thread::{self, JoinHandle}, time};
+use std::{collections::HashMap, io::Read, sync::{atomic::{AtomicBool, AtomicUsize}, Arc}, thread::{self, JoinHandle}, time::{self, Duration}};
 use anyhow::{anyhow};
 use arrow::{array::{Array, ArrayRef as ArrowArrayRef}, compute::{SortColumn, TakeOptions}};
 use arrow_array::UInt32Array;
@@ -67,17 +67,17 @@ use crate::{arraybuilder, partition::{self, get_parition_key_from_first_val, Def
  *  2. 销毁时对线程暂停处理，对调用返回异常。
  *  3. 清理已经存在的内存数据
  */
-struct ArrowLoader<T>
+pub struct ArrowLoader<T>
 where T : Into<Vec<u8>> + Send + 'static
 {
-    sql_datasets_op : Option<Vec<T>>,
+    sql_dataset_op : Option<Vec<T>>,
     batch_data_threshold : usize,
     thread_num : usize,
     columns: ColumnArrStrDef,
     partition_func_op : Option<Arc<dyn PartitionFunc>>,
     compression_type_op : Option<String>,
     dialect_op : Option<String>,
-    state: AtomicUsize,
+    state: Arc<AtomicUsize>,
     res_rx_op : Option<Receiver<anyhow::Result<Vec<Vec<PyArray>>>>>,
     worker_thread_handlers : Vec<JoinHandle<()>>,
     collector_thread_handler : Vec<JoinHandle<()>>,
@@ -91,14 +91,14 @@ const STATE_STOPPING : usize = 30;
 const STATE_FINISHED : usize = 40;
 
 impl <T> ArrowLoader <T>
-where T : Into<Vec<u8>> + Send + Sync + 'static
+where T : Into<Vec<u8>> + Send + 'static
 {
-    fn new(sql_datasets : Vec<T>, columns : ColumnArrStrDef,
-        partition_func_op : Option<Arc<dyn PartitionFunc>>,
+    pub fn new(sql_dataset : Vec<T>, columns : ColumnArrStrDef,
+        thread_num : usize,
+        batch_data_threshold : usize,
         compression_type_op : Option<String>,
         dialect_op : Option<String>,
-        batch_data_threshold : usize,
-        thread_num : usize,
+        partition_func_op : Option<Arc<dyn PartitionFunc>>,
     ) -> ArrowLoader<T> {
         let thread_num = if thread_num == 0 {
             //default thread num
@@ -108,14 +108,14 @@ where T : Into<Vec<u8>> + Send + Sync + 'static
         };
 
         ArrowLoader {
-            sql_datasets_op : Some(sql_datasets),
+            sql_dataset_op : Some(sql_dataset),
             batch_data_threshold : batch_data_threshold,
             thread_num : thread_num,
             columns : columns,
             partition_func_op : partition_func_op,
             compression_type_op : compression_type_op,
             dialect_op : dialect_op,
-            state : AtomicUsize::new(STATE_UNITIALIZED),
+            state : Arc::new(AtomicUsize::new(STATE_UNITIALIZED)),
             res_rx_op : None,
             worker_thread_handlers : Vec::with_capacity(thread_num),
             collector_thread_handler : Vec::with_capacity(1),
@@ -123,7 +123,7 @@ where T : Into<Vec<u8>> + Send + Sync + 'static
         }
     }
 
-    fn next_batch_data(&mut self) -> Option<anyhow::Result<Vec<Vec<PyArray>>>> {
+    pub fn next_batch_data(&mut self) -> anyhow::Result<Option<Vec<Vec<PyArray>>>> {
         let cur_state = match self.state.compare_exchange(STATE_UNITIALIZED, STATE_INITIALIZING, std::sync::atomic::Ordering::Acquire, std::sync::atomic::Ordering::Relaxed) {
             Ok(_) => {
                 self.init();
@@ -132,37 +132,36 @@ where T : Into<Vec<u8>> + Send + Sync + 'static
             Err(v) => v,
         };
 
-        match cur_state {
-            STATE_INITIALIZED => {
-                // start loading
-                let _ = self.state.compare_exchange(STATE_INITIALIZED, STATE_LOADING, std::sync::atomic::Ordering::Acquire, std::sync::atomic::Ordering::Relaxed);
-            },
-            STATE_STOPPING => {
-                return Some(Err(anyhow!("arrow loader is stopping")));
-            },
-            STATE_FINISHED => {
-                return None;
-            },
-            _ => {
-                return Some(Err(anyhow!("arrow loader ")));
+        if cur_state != STATE_LOADING {
+            match cur_state {
+                STATE_STOPPING => {
+                    return Err(anyhow!("arrow loader is stopping"));
+                },
+                STATE_FINISHED => {
+                    return Ok(None);
+                },
+                _ => {
+                    return Err(anyhow!("arrow loader "));
+                }
             }
         }
+        
 
         match self.res_rx_op.as_ref().unwrap().recv() {
             Ok(res) => {
                 match res {
                     Ok(arr_refs_batch) => {
-                        return Some(Ok(arr_refs_batch));
+                        return Ok(Some(arr_refs_batch));
                     },
                     Err(e) => {
                         self.stop();
-                        return Some(Err(e));
+                        return Err(e);
                     }
                 }
             },
             Err(e) => {
                 self.stop();
-                return Some(Err(anyhow::Error::new(e)));
+                return Err(anyhow::Error::new(e));
             }
         }
     }
@@ -180,27 +179,32 @@ where T : Into<Vec<u8>> + Send + Sync + 'static
 
         let (raw_res_tx, raw_res_rx) = crossbeam_channel::bounded::<anyhow::Result<HashMap<PartitionKey, Vec<ArrowArrayRef>>>>(self.thread_num);
 
-        let (res_tx, res_rx) = crossbeam_channel::bounded::<anyhow::Result<Vec<Vec<PyArray>>>>(self.thread_num);
+        let (res_tx, res_rx) = crossbeam_channel::bounded::<anyhow::Result<Vec<Vec<PyArray>>>>(0);
         self.res_rx_op = Some(res_rx.clone());
 
         //sql_dataset iterate and send to channel
         let thread_sql_dataset_tx = sql_dataset_tx.clone();
-        let thread_sql_datasets = self.sql_datasets_op.replace(vec![]).unwrap();
+        let thread_sql_datasets = self.sql_dataset_op.replace(vec![]).unwrap();
+        pydebug!("init sql_dataset_iter_thread_handler");
         let sql_dataset_iter_thread_handler = thread::spawn(move || {
             for res_data in thread_sql_datasets {
-                let _ = thread_sql_dataset_tx.send(Ok(res_data));
+                if let Err(e) = thread_sql_dataset_tx.send(Ok(res_data)) {
+                    break;
+                }
             }
         });
         self.sql_dataset_iter_thread_handler.push(sql_dataset_iter_thread_handler);
 
         
         for i in 0..self.thread_num {
+            pydebug!("start thread idx:{}", i);
             let thread_partition_func_op = self.partition_func_op.clone();
             let thread_compression_type_op = self.compression_type_op.clone();
-            let thread_dialect_op = self.compression_type_op.clone();
+            let thread_dialect_op = self.dialect_op.clone();
             let thread_sql_dataset_rx = sql_dataset_rx.clone();
             let thread_raw_res_tx = raw_res_tx.clone();
             let thread_columns = self.columns.clone();
+            let thread_state = self.state.clone();
             let i_thread = i;
             let handler = thread::spawn(move || {
                 Self::worker_thread_fn(
@@ -208,7 +212,9 @@ where T : Into<Vec<u8>> + Send + Sync + 'static
                     thread_raw_res_tx, thread_columns,
                     thread_partition_func_op,
                     thread_compression_type_op,
-                    thread_dialect_op, i_thread
+                    thread_dialect_op, 
+                    thread_state,
+                    i_thread
                 );
             });
             self.worker_thread_handlers.push(handler);
@@ -222,29 +228,53 @@ where T : Into<Vec<u8>> + Send + Sync + 'static
         let collector_handler = thread::spawn(move || {
             Self::collector_thread_fn(thread_batch_data_threshold, thread_columns, thread_raw_res_rx, thread_res_tx);
         });
+        self.collector_thread_handler.push(collector_handler);
     }
 
-    fn stop(&mut self) {
+    pub fn stop(&mut self) {
         let state = self.state.load(std::sync::atomic::Ordering::Relaxed);
         let res = match state {
-            STATE_INITIALIZED => {
-                self.state.compare_exchange(STATE_INITIALIZED, STATE_STOPPING, std::sync::atomic::Ordering::Acquire, std::sync::atomic::Ordering::Relaxed)
-            },
             STATE_LOADING => {
                 self.state.compare_exchange(STATE_LOADING, STATE_STOPPING, std::sync::atomic::Ordering::Acquire, std::sync::atomic::Ordering::Relaxed)
             },
             _ => {
-                Err(state)
+                return;
             }
         };
         if res.is_err() {
             //do nothing
             return;
         }
-        todo!()
+
+        for h in std::mem::take(&mut self.worker_thread_handlers) {
+            let _ = h.join();
+        }
+
+        for h in std::mem::take(&mut self.collector_thread_handler) {
+            let _ = h.join();
+        }
+
+        for h in std::mem::take(&mut self.sql_dataset_iter_thread_handler) {
+            let _ = h.join();
+        }
+
+        if let Some(rx) = &self.res_rx_op {
+            if rx.is_empty() {
+                //empty the rx
+                let _ = rx.recv_timeout(Duration::from_secs(1));
+            }
+        }
+
+        self.state.store(STATE_FINISHED, std::sync::atomic::Ordering::SeqCst);
+        pydebug!("arrow loader stoped");
     }
 
-    fn collector_thread_fn(batch_data_threshold : usize, columns : ColumnArrStrDef, raw_res_rx : Receiver<Result<HashMap<PartitionKey, Vec<ArrowArrayRef>>, anyhow::Error>>, res_tx : Sender<Result<Vec<Vec<PyArray>>, anyhow::Error>>) {
+    fn collector_thread_fn(
+        batch_data_threshold : usize,
+        columns : ColumnArrStrDef,
+        raw_res_rx : Receiver<Result<HashMap<PartitionKey, Vec<ArrowArrayRef>>, anyhow::Error>>,
+        res_tx : Sender<Result<Vec<Vec<PyArray>>, anyhow::Error>>
+    ) {
         
         let mut hash_arr_refs_batch = HashMap::<PartitionKey, Vec<Vec<ArrowArrayRef>>>::new();
         let mut arrow_batch_data_len :usize = 0;
@@ -252,12 +282,14 @@ where T : Into<Vec<u8>> + Send + Sync + 'static
             match array_refs_res {
                 Ok(hash_arr_refs) => {
                     for (partition_key, arr_refs) in hash_arr_refs {
+                        let row_len = arr_refs[0].len();
+                        pydebug!("recive raw_res! partition_key:{:?}, arr_ref len:{}", partition_key, row_len);
                         if !hash_arr_refs_batch.contains_key(&partition_key) {
                             let arr_refs_batch = Vec::<Vec<ArrowArrayRef>>::with_capacity(12);
                             hash_arr_refs_batch.insert(partition_key.clone(), arr_refs_batch);
                         }
                         let arr_refs_batch = hash_arr_refs_batch.get_mut(&partition_key).unwrap();
-                        arrow_batch_data_len += arr_refs.len();
+                        arrow_batch_data_len += row_len;
                         arr_refs_batch.push(arr_refs);
                     }
 
@@ -295,6 +327,7 @@ where T : Into<Vec<u8>> + Send + Sync + 'static
         partition_func_op : Option<Arc<dyn PartitionFunc>>,
         compression_type_op : Option<String>,
         dialect_op : Option<String>,
+        state : Arc<AtomicUsize>,
         i_thread : usize
     ) {
     
@@ -313,11 +346,14 @@ where T : Into<Vec<u8>> + Send + Sync + 'static
                 Ok(sql_dataset) => {
                     let sql_data_res = decompress_by_type(sql_dataset.into(), compression_type_op.clone(), i_thread);
                     if sql_data_res.is_err() {
+                        pydebug!("{:?}", &sql_data_res);
                         let _ = raw_res_tx.send(Err(sql_data_res.err().unwrap()));
                         break;
                     } else {
                         let res_for_send : anyhow::Result<HashMap<PartitionKey, Vec<ArrowArrayRef>>> = (|| {
                             let sql_data = sql_data_res.unwrap();
+                            pydebug!("sql_data len: {}", sql_data.len());
+                            pydebug!("dialect: {}", &dialect_str);
                             let arr_refs = load_sql_data_to_arrref(&sql_data, &columns, &dialect_str, i_thread)?;
                             let partition_val_arr_refs = partition_func.transform(&arr_refs)?;
                             let indices = get_sorted_indices_from_multi_cols(&partition_val_arr_refs)?;
@@ -331,6 +367,9 @@ where T : Into<Vec<u8>> + Send + Sync + 'static
                     let _ = raw_res_tx.send(Err(e));
                 },
             };
+            if state.load(std::sync::atomic::Ordering::Relaxed) != STATE_LOADING {
+                break;
+            }
         }
         drop(raw_res_tx);
     }
@@ -577,17 +616,6 @@ impl <T> Drop for ArrowLoader<T>
 where T : Into<Vec<u8>> + Send + 'static
 {
     fn drop(&mut self) {
-        todo!()
-    }
-}
-
-
-impl <T> Iterator for ArrowLoader<T> 
-where T : Into<Vec<u8>> + Send + 'static
-{
-    type Item = anyhow::Result<(usize, Vec<ArrowArrayRef>)>;
-
-    fn next(&mut self) -> Option<Self::Item> {
-        todo!()
+        self.stop();
     }
 }

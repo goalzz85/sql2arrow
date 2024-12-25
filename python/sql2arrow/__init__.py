@@ -118,3 +118,35 @@ def _load_data_file_by_pyarrow_fs(sql_paths, pyarrow_fs):
             data = future.result()  # 获取任务结果
             all_datas[i] = data
     return all_datas
+
+
+class SQLFile2ArrowIter:
+    def __init__(
+            self,
+            sqlfile_paths : List[str],
+            columns : List[Column],
+            thread_num : int,
+            batch_data_threshold : int = 0,
+            compression : CompressionType = CompressionType.NONE,
+            dialect : Dialect = Dialect.MYSQL,
+            partition_func = None
+            ):
+        column_defs = [(c.name, c.type) for c in columns]
+        self.inner_iter = s2a.SQLFile2ArrowLoader(
+            sqlfile_paths,
+            column_defs,
+            thread_num,
+            batch_data_threshold,
+            compression and compression.value,
+            dialect and dialect.value,
+            partition_func
+        )
+
+    def __iter__(self):
+        return self
+    
+    def __next__(self):
+        try:
+            return self.inner_iter.next_batch_data()
+        except:
+            raise StopIteration

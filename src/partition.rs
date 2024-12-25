@@ -1,5 +1,6 @@
 use std::{collections::HashMap, hash::Hash};
-use arrow_array::ArrayRef;
+use arrow::{array::{ArrayBuilder, BufferBuilder}, buffer::ScalarBuffer, datatypes::{Int8Type, UInt8Type}};
+use arrow_array::{ArrayRef, PrimitiveArray};
 use arrow_schema::{DataType, TimeUnit};
 use iceberg::{spec::Transform, transform::create_transform_function};
 use pyo3::prelude::*;
@@ -60,8 +61,13 @@ impl PartitionFunc for DefaultPartition {
     }
 
     fn transform(&self, arr_refs : &Vec<ArrayRef>) -> anyhow::Result<Vec<ArrayRef>> {
-        let _ = arr_refs;
-        Err(anyhow!("not implement the PartitionFunc"))
+        let arr_len = arr_refs[0].len();
+        let mut buf_builder = BufferBuilder::<i8>::new(arr_len);
+        buf_builder.append_n_zeroed(arr_len);
+        let buf = buf_builder.finish();
+        let arr = PrimitiveArray::<Int8Type>::new(ScalarBuffer::new(buf, 0, arr_len), None);
+
+        Ok(vec![Arc::new(arr)])
     }
 }
 
@@ -155,6 +161,10 @@ pub fn get_parition_key_from_first_val(partition_val_arr_refs: &Vec<ArrayRef>) -
         }
 
         match arr_ref.data_type() {
+            DataType::Int8 => {
+                let v = arr_ref.as_any().downcast_ref::<arrow::array::Int8Array>().unwrap().value(0);
+                pk.extend_from_slice(&v.to_be_bytes());
+            }
             DataType::Int32 => {
                 let v = arr_ref.as_any().downcast_ref::<arrow::array::Int32Array>().unwrap().value(0);
                 pk.extend_from_slice(&v.to_be_bytes());
