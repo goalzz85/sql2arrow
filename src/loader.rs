@@ -1,5 +1,5 @@
-use std::{collections::HashMap, io::Read, sync::{atomic::{AtomicBool, AtomicUsize}, Arc}, thread::{self, JoinHandle}, time::{self, Duration}};
-use anyhow::{anyhow};
+use std::{collections::HashMap, io::Read, sync::{atomic::AtomicUsize, Arc}, thread::{self, JoinHandle}, time::{self}};
+use anyhow::anyhow;
 use arrow::{array::{Array, ArrayRef as ArrowArrayRef}, compute::{SortColumn, TakeOptions}};
 use arrow_array::UInt32Array;
 use crossbeam_channel::{Receiver, Sender};
@@ -7,66 +7,8 @@ use flate2::read::GzDecoder;
 use pyo3_arrow::PyArray;
 use sqlparser::{ast::{Insert, SetExpr, Statement, Values}, dialect::{self, Dialect}};
 
-use crate::{arraybuilder, partition::{self, get_parition_key_from_first_val, DefaultPartition, PartitionFunc, PartitionKey}, pydebug, types::{self, ColumnArrStrDef}};
+use crate::{arraybuilder, partition::{get_parition_key_from_first_val, DefaultPartition, PartitionFunc, PartitionKey}, pydebug, types::{self, ColumnArrStrDef}};
 
-// struct SqlDataIter<T>
-// where T : Into<Vec<u8>> + Send + 'static
-// {
-//     sql_datasets : Vec<T>,
-//     idx : usize
-// }
-
-// impl <'a, T> SqlDataIter<'a, T> 
-// where T : 'a + Into<Vec<u8>> + Send
-// {
-//     fn new(sql_datasets : &[T]) -> SqlDataIter<T> {
-//         SqlDataIter {
-//             sql_datasets : sql_datasets,
-//             idx : 0,
-//         }
-//     }
-// }
-
-// impl <'a, T> Iterator for SqlDataIter<'a, T> 
-// where T : 'a + Into<Vec<u8>> + Send
-// {
-//     type Item = &'a T;
-    
-//     fn next(&mut self) -> Option<Self::Item> {
-//         if self.idx < self.sql_datasets.len() {
-//             let res = &self.sql_datasets[self.idx];
-//             self.idx += 1;
-//             Some(res)
-//         } else {
-//             None
-//         }
-//     }
-// }
-
-
-
-
-//基本逻辑是只多算一个周期的数据，避免内存问题，周期计算方式再看
-//当前算完了等待next处理的时候，可以继续算，如果没有取，任务就不进线程池
-//线程池需要挂住以及等待，直到明确退出。
-//线程池为每个generator独立线程池，根据用户自行设置决定。
-//Loader本身不支持多线程的传递
-
-/*
- * 基础逻辑为：
- *  1. 调用 load方法获取一个结果集，[]，一直调用直到为None
- *  2. 结束。
- * 
- * 内部逻辑：
- *  1. 第一次load时进行初始化。
- *  2. 初始化对线程池初始化。
- *  3. 创建处理任务给到线程池。
- *  4. 
- * 销毁逻辑：
- *  1. py对应对象持有这个generator
- *  2. 销毁时对线程暂停处理，对调用返回异常。
- *  3. 清理已经存在的内存数据
- */
 pub struct ArrowLoader<T>
 where T : Into<Vec<u8>> + Send + 'static
 {
@@ -159,9 +101,9 @@ where T : Into<Vec<u8>> + Send + 'static
                     }
                 }
             },
-            Err(e) => {
+            Err(_) => {
                 self.stop();
-                return Err(anyhow::Error::new(e));
+                return Ok(None);
             }
         }
     }
@@ -185,10 +127,9 @@ where T : Into<Vec<u8>> + Send + 'static
         //sql_dataset iterate and send to channel
         let thread_sql_dataset_tx = sql_dataset_tx.clone();
         let thread_sql_datasets = self.sql_dataset_op.replace(vec![]).unwrap();
-        pydebug!("init sql_dataset_iter_thread_handler");
         let sql_dataset_iter_thread_handler = thread::spawn(move || {
             for res_data in thread_sql_datasets {
-                if let Err(e) = thread_sql_dataset_tx.send(Ok(res_data)) {
+                if let Err(_) = thread_sql_dataset_tx.send(Ok(res_data)) {
                     break;
                 }
             }
@@ -197,7 +138,6 @@ where T : Into<Vec<u8>> + Send + 'static
 
         
         for i in 0..self.thread_num {
-            pydebug!("start thread idx:{}", i);
             let thread_partition_func_op = self.partition_func_op.clone();
             let thread_compression_type_op = self.compression_type_op.clone();
             let thread_dialect_op = self.dialect_op.clone();
@@ -246,6 +186,10 @@ where T : Into<Vec<u8>> + Send + 'static
             return;
         }
 
+        if let Some(rx) = self.res_rx_op.take() {
+            drop(rx);
+        }
+
         for h in std::mem::take(&mut self.worker_thread_handlers) {
             let _ = h.join();
         }
@@ -256,13 +200,6 @@ where T : Into<Vec<u8>> + Send + 'static
 
         for h in std::mem::take(&mut self.sql_dataset_iter_thread_handler) {
             let _ = h.join();
-        }
-
-        if let Some(rx) = &self.res_rx_op {
-            if rx.is_empty() {
-                //empty the rx
-                let _ = rx.recv_timeout(Duration::from_secs(1));
-            }
         }
 
         self.state.store(STATE_FINISHED, std::sync::atomic::Ordering::SeqCst);
@@ -283,7 +220,6 @@ where T : Into<Vec<u8>> + Send + 'static
                 Ok(hash_arr_refs) => {
                     for (partition_key, arr_refs) in hash_arr_refs {
                         let row_len = arr_refs[0].len();
-                        pydebug!("recive raw_res! partition_key:{:?}, arr_ref len:{}", partition_key, row_len);
                         if !hash_arr_refs_batch.contains_key(&partition_key) {
                             let arr_refs_batch = Vec::<Vec<ArrowArrayRef>>::with_capacity(12);
                             hash_arr_refs_batch.insert(partition_key.clone(), arr_refs_batch);
@@ -346,14 +282,11 @@ where T : Into<Vec<u8>> + Send + 'static
                 Ok(sql_dataset) => {
                     let sql_data_res = decompress_by_type(sql_dataset.into(), compression_type_op.clone(), i_thread);
                     if sql_data_res.is_err() {
-                        pydebug!("{:?}", &sql_data_res);
                         let _ = raw_res_tx.send(Err(sql_data_res.err().unwrap()));
                         break;
                     } else {
                         let res_for_send : anyhow::Result<HashMap<PartitionKey, Vec<ArrowArrayRef>>> = (|| {
                             let sql_data = sql_data_res.unwrap();
-                            pydebug!("sql_data len: {}", sql_data.len());
-                            pydebug!("dialect: {}", &dialect_str);
                             let arr_refs = load_sql_data_to_arrref(&sql_data, &columns, &dialect_str, i_thread)?;
                             let partition_val_arr_refs = partition_func.transform(&arr_refs)?;
                             let indices = get_sorted_indices_from_multi_cols(&partition_val_arr_refs)?;

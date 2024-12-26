@@ -1,5 +1,5 @@
 use std::{collections::HashMap, hash::Hash};
-use arrow::{array::{ArrayBuilder, BufferBuilder}, buffer::ScalarBuffer, datatypes::{Int8Type, UInt8Type}};
+use arrow::{array::BufferBuilder, buffer::ScalarBuffer, datatypes::Int8Type};
 use arrow_array::{ArrayRef, PrimitiveArray};
 use arrow_schema::{DataType, TimeUnit};
 use iceberg::{spec::Transform, transform::create_transform_function};

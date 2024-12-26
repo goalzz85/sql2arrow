@@ -57,11 +57,19 @@ columns = [
 partition_func_spec = sql2arrow.partition.IcebergPartitionFuncSpec()
 partition_func_spec.add_partition("region_code", sql2arrow.partition.IcebergTransforms.bucket(30))
 
-# load data with partition func
-partitioned_arrs = sql2arrow.load_sqls_with_partition_func(sql_paths, columns, partition_func_spec, sql2arrow.CompressionType.GZIP, sql2arrow.Dialect.MYSQL)
 
-# load data from files one by one
-arrs = sql2arrow.load_sqls(sql_paths, columns, sql2arrow.CompressionType.GZIP, sql2arrow.Dialect.MYSQL)
+it = sql2arrow.SQLFile2ArrowIter(
+    sql_paths,
+    columns,
+    4,
+    1000,
+    sql2arrow.CompressionType.SNAPPY,
+    sql2arrow.Dialect.MYSQL,
+    partition_func_spec
+)
+
+for arr in it:
+    print(arr)
 ```
 
 
@@ -78,4 +86,4 @@ tables = [pa.Table.from_arrays(a, names=names) for a in arrs]
 ## Limitations
 
 ### Dialect
-    It currently supports only MySQL INSERT statements, but PostgreSQL support will be added soon.
+    It currently supports only MySQL and PostgreSQL INSERT statements.
